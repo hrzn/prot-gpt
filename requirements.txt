@@ -1,0 +1,4 @@
+matplotlib
+tiktoken
+tqdm
+torch
