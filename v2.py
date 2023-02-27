@@ -13,7 +13,7 @@ n_blocks = 3 if device == "cpu" else 6  # number N of transformer blocks
 num_heads = 4 if device == "cpu" else 6  # nr attention heads
 dropout = 0.2
 max_iters = 5000
-eval_interval = 500
+eval_interval = 500 if device == "cpu" else 10
 learning_rate = 1e-3 if device == "cpu" else 3e-4
 
 eval_iters = 200
