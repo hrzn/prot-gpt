@@ -191,6 +191,7 @@ class SimpleTransformer(nn.Module):
 
 model = SimpleTransformer()
 model = model.to(device)
+print(sum(p.numel() for p in model.parameters()) / 1e6, 'M parameters')
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
