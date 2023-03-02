@@ -17,8 +17,12 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)  # from Karpathy's video
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
-    def forward(self, x):
-        # x: (B, T, n_embd)
+    def forward(self, x, lengths=None):
+        # inputs:
+        # x: (B, T, d_model) the tokens embeddings
+        # lengths: (B, ); the original lengths of the sequences in the batch
+        #                 (before padding). Needed for masking.
+
         # output: (B, T, d_model)
         B, T, _ = x.shape
 
@@ -32,6 +36,26 @@ class Head(nn.Module):
         # (in encoder blocks all tokens can talk to each other)
         # Note: we take last T entries in tril, in case T < block_size
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+
+        # mask padding tokens to avoid communication between them and other tokens
+        # we still want to make it possible for tokens to be self-attending
+        # in order to avoid normalization issues with softmax.
+        if lengths is not None:
+            # (B, T)
+            mask = torch.arange(T, device=x.device)[None, :] < lengths[:, None]
+
+            # (B, 1, T)
+            mask = mask[:, None, :]
+
+            # (B, T, T)
+            mask = mask & mask.transpose(-2, -1)
+
+            # (B, T, T), enable diagonal entries for tokens to self-attend
+            # (even padded ones, otherwise softmax normalization will yield NaNs)
+            mask = mask | torch.eye(T, device=x.device, dtype=torch.bool)[None, :, :]
+
+            weights = weights.masked_fill(~mask, float("-inf"))
+
         weights = weights * self.head_size**-0.5
 
         # apply softmax
@@ -54,8 +78,8 @@ class MultiHeadAttention(nn.Module):
         )  # linear layer after concat, as per transformer paper
         self.dropout = nn.Dropout(dropout)  # from Karpathy's video
 
-    def forward(self, x):
-        out = torch.cat([head(x) for head in self.heads], dim=-1)
+    def forward(self, x, lengths=None):
+        out = torch.cat([head(x, lengths) for head in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
 
@@ -88,16 +112,24 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         # the original transformer implements layer norm after the transformation
         # but here we implement the "pre-norm" version, now slightly more common,
         # where the layer norm is applied before the transformation
 
         # masked multi-head attn
-        x = x + self.multi_head_attn(self.ln1(x))
+        x = x + self.multi_head_attn(self.ln1(x), lengths)
 
         # feed forward
         x = x + self.ffwd(self.ln2(x))
+        return x
+
+
+class SequentialWithLengths(nn.Sequential):
+    # our own implementation of Sequential supporting two inputs
+    def forward(self, x, lengths=None):
+        for module in self:
+            x = module(x, lengths)
         return x
 
 
@@ -110,17 +142,17 @@ class NanoTransformer(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = torch.nn.Sequential(
-            *[Block(n_embd, num_heads, block_size, dropout) for _ in range(n_blocks)],
-            nn.LayerNorm(n_embd)
+        self.blocks = SequentialWithLengths(
+            *[Block(n_embd, num_heads, block_size, dropout) for _ in range(n_blocks)]
         )
+        self.ln = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(
             n_embd, vocab_size
         )  # go from inner dim (concatenated) to logits
         self.block_size = block_size
 
-    def forward(self, idx, targets=None):
-        # idx: (B, T), targets: (B, T)
+    def forward(self, idx, targets=None, lengths=None):
+        # idx: (B, T), lengths: (B,), targets: (B, T)
         B, T = idx.shape
 
         tok_emb = self.token_embedding_table(idx)  # (B, T, C), with C = n_embd
@@ -129,7 +161,8 @@ class NanoTransformer(nn.Module):
         )  # (T, C)
         x = tok_emb + pos_emb  # (B, T, C)
 
-        x = self.blocks(x)  # (B, T, C)
+        x = self.blocks(x, lengths)  # (B, T, C)
+        x = self.ln(x)
 
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
@@ -143,8 +176,8 @@ class NanoTransformer(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
+    def generate_line(self, idx, termination_token_idx):
+        while idx[0][-1].item() != termination_token_idx:
             logits, _ = self(idx[:, -self.block_size :])
             logits = logits[:, -1, :]  # (B, C)
             probs = F.softmax(logits, dim=-1)  # (B, C)
