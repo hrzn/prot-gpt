@@ -176,11 +176,31 @@ class NanoTransformer(nn.Module):
 
         return logits, loss
 
-    def generate_line(self, idx, termination_token_idx):
-        while idx[0][-1].item() != termination_token_idx:
+    def generate(self, idx, max_new_tokens):
+        """
+        Used to generate a chunk of text potentially containing multiple lines.
+        Works on batches.
+        """
+        for _ in range(max_new_tokens):
             logits, _ = self(idx[:, -self.block_size :])
             logits = logits[:, -1, :]  # (B, C)
             probs = F.softmax(logits, dim=-1)  # (B, C)
             idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
             idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
+
+    def generate_line(self, idx, termination_token_idx, pad_token_idx):
+        """
+        Used to generate a single line.
+        Works only for batch size 1.
+        """
+        while idx[0][-1].item() != termination_token_idx:
+            logits, _ = self(idx=idx[:, -self.block_size :])
+            logits = logits[:, -1, :]  # (B, C)
+            probs = F.softmax(logits, dim=-1)  # (B, C)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+
+            if idx_next[0].item() != pad_token_idx:
+                # if next character is a pad character, that's a mistake, we ignore it
+                idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+        return idx[0]
