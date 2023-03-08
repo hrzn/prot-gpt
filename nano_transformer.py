@@ -5,6 +5,7 @@ A nano GPT model, inspired from Karpathy's NanoGPT
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import pytorch_lightning as pl
 
 
 class Head(nn.Module):
@@ -204,3 +205,33 @@ class NanoTransformer(nn.Module):
                 # if next character is a pad character, that's a mistake, we ignore it
                 idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx[0]
+
+
+class PLNanoTransformer(pl.LightningModule):
+    """A PyTorch Lightning wrapper for the NanoTransformer"""
+
+    def __init__(self, model, lr):
+        super().__init__()
+        self.model = model
+        self.lr = lr
+        self.save_hyperparameters("model", "lr")
+
+    def forward(self, x, y, lengths):
+        return self.model(x, y, lengths)
+
+    def training_step(self, batch, batch_idx):
+        x, y, lengths = batch
+        _, loss = self.model(x, y, lengths)
+        self.log("train_loss", loss)
+        self.logger.experiment.add_scalar("train_loss", loss, self.global_step)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y, lengths = batch
+        _, loss = self.model(x, y, lengths)
+        self.log("val_loss", loss)
+        self.logger.experiment.add_scalar("val_loss", loss, self.global_step)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.model.parameters(), lr=self.lr)
