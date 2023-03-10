@@ -18,4 +18,4 @@ plt.hist(
     label="generated",
 )
 plt.legend()
-plt.show()
+plt.savefig("figures/lengths.png", dpi=120)

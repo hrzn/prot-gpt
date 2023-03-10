@@ -134,7 +134,42 @@ class SequentialWithLengths(nn.Sequential):
         return x
 
 
-class NanoTransformer(nn.Module):
+class GenerativeModel(nn.Module):
+    """
+    Super class for generative models
+    """
+
+    def generate(self, idx, max_new_tokens):
+        """
+        Used to generate a chunk of text potentially containing multiple lines.
+        Works on batches.
+        """
+        for _ in range(max_new_tokens):
+            logits, _ = self(idx[:, -self.block_size :])
+            logits = logits[:, -1, :]  # (B, C)
+            probs = F.softmax(logits, dim=-1)  # (B, C)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+        return idx
+
+    def generate_line(self, idx, termination_token_idx, pad_token_idx):
+        """
+        Used to generate a single line.
+        Works only for batch size 1.
+        """
+        while idx[0][-1].item() != termination_token_idx:
+            logits, _ = self(idx=idx[:, -self.block_size :])
+            logits = logits[:, -1, :]  # (B, C)
+            probs = F.softmax(logits, dim=-1)  # (B, C)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+
+            if idx_next[0].item() != pad_token_idx:
+                # if next character is a pad character, that's a mistake, we ignore it
+                idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+        return idx[0]
+
+
+class NanoTransformer(GenerativeModel):
     """
     A simple transformer made only of decoder (causal) blocks and no encoding block.
     """
@@ -177,34 +212,29 @@ class NanoTransformer(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
-        """
-        Used to generate a chunk of text potentially containing multiple lines.
-        Works on batches.
-        """
-        for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -self.block_size :])
-            logits = logits[:, -1, :]  # (B, C)
-            probs = F.softmax(logits, dim=-1)  # (B, C)
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
-            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
-        return idx
 
-    def generate_line(self, idx, termination_token_idx, pad_token_idx):
-        """
-        Used to generate a single line.
-        Works only for batch size 1.
-        """
-        while idx[0][-1].item() != termination_token_idx:
-            logits, _ = self(idx=idx[:, -self.block_size :])
-            logits = logits[:, -1, :]  # (B, C)
-            probs = F.softmax(logits, dim=-1)  # (B, C)
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+class BigramModel(GenerativeModel):
+    """
+    Another, simpler model, that predicts the next character based on the previous one.
+    """
 
-            if idx_next[0].item() != pad_token_idx:
-                # if next character is a pad character, that's a mistake, we ignore it
-                idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
-        return idx[0]
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+
+    def forward(self, idx, targets=None):
+        # idx: (B, T), targets: (B, T)
+        logits = self.token_embedding_table(idx)  # (B, T, C)
+
+        B, T, C = logits.shape
+
+        loss = (
+            F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
+            if targets is not None
+            else None
+        )
+
+        return logits, loss
 
 
 class PLNanoTransformer(pl.LightningModule):
@@ -220,15 +250,13 @@ class PLNanoTransformer(pl.LightningModule):
         return self.model(x, y, lengths)
 
     def training_step(self, batch, batch_idx):
-        x, y, lengths = batch
-        _, loss = self.model(x, y, lengths)
+        _, loss = self.model(*batch)
         self.log("train_loss", loss)
         self.logger.experiment.add_scalar("train_loss", loss, self.global_step)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y, lengths = batch
-        _, loss = self.model(x, y, lengths)
+        _, loss = self.model(*batch)
         self.log("val_loss", loss)
         self.logger.experiment.add_scalar("val_loss", loss, self.global_step)
         return loss
