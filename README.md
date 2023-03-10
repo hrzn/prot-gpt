@@ -1,5 +1,15 @@
 # prot-gpt
-Nano prot gpt
+
+![nanoGPT](assets/img.png)
+
+This an implementation of nano (femto?) GPT model trainable on protein sequences made of amino acids; inspired from the [original NanoGPT](https://github.com/karpathy/nanoGPT) implementation of Andrej Karpathy. Compared to the original implementations the main changes are:
+* This model trains on multiple *independent* sequences. That is, the context only contains the current sequence (and not those appearing before in the training set).
+* Since the protein sequences have variable lengths, it does padding and masking. The sequences are padded to the block size (for batching), and the weights corresponding to the padded tokens are then masked out inside the transformer model, in order to avoid communication to/from padded tokens.
+* The training loop relies on PyTorch Lightning, which makes our lives a little easier.
+
+The default parameters in `train_proteins.py` will build a ~10M parameters models trainable in a few hours on a GPU with 8 GB of RAM (e.g. 2080).
+
+![nanoGPT](assets/val_loss.png)
 
 
 ## Procedure
