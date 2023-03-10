@@ -1,13 +1,15 @@
 """
 Training a simple NanoGPT model on protein sequences
 
-Adapted from Karpathy's NanoGPT (https://github.com/karpathy/nanoGPT) with some adaptations:
+Adapted from Karpathy's NanoGPT (https://github.com/karpathy/nanoGPT) with some changes:
+* Make it trainable on multiple isolated sequences of variable lengths, 
+  using padding and masking the transformer's weights accordingly.
+* Use PyTorch Lightning for the training loop
 * Vocabulary is amino acids
-* Make it trainable on multiple isolated sequences of variable lengths, using padding and masking
-* Use PyTorch Lightning for training loop
 
-The dataset comes from
-https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+The original PDB sequence dataset comes from
+https://ftp.wwpdb.org/pub/pdb/derived_data/pdb_seqres.txt.gz
+and has been preprocessed by `preprocess_pdb_seqres.py`.
 """
 
 import torch
@@ -16,36 +18,41 @@ import numpy as np
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
-import matplotlib.pyplot as plt
-from torch.utils.data import Sampler
-from typing import Tuple
 from pytorch_lightning.callbacks import TQDMProgressBar, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning import seed_everything
+import os
 
-from nano_transformer import NanoTransformer, PLNanoTransformer
+from nano_transformer import NanoTransformer, BigramModel, PLNanoTransformer
 
 
 seed_everything(1337)
 
 PROT_FNAME = "data/prot_seqs.txt"
 
+# We leave the possibility to benchmark against a simple bigram model
+# True: train NanoTransformer, False: train BigramModel
+USE_TRANSFORMER = True
+
 # hyperparameters
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32 if DEVICE == "cpu" else 64
-BLOCK_SIZE = 8 if DEVICE == "cpu" else 256  # context size
+BLOCK_SIZE = 8 if DEVICE == "cpu" else 384  # context size
 N_EMBD = 16 if DEVICE == "cpu" else 384  # called d_model in paper
 N_BLOCKS = 2 if DEVICE == "cpu" else 6  # number N of transformer blocks
 NUM_HEADS = 2 if DEVICE == "cpu" else 6  # nr attention heads
 DROPOUT = 0.2
-MAX_ITERS = 5000
-EVAL_INTERVAL = 500
-# LEARNING_RATE = 3e-4
+MAX_ITERS = 75000
+EVAL_INTERVAL = 5000
 LEARNING_RATE = 1e-3 if DEVICE == "cpu" else 3e-4
-EVAL_ITERS = 200
-PRECISION = 32
-CHECKPOINT_EVERY_STEP = 500
+EVAL_ITERS = 500
+PRECISION = 32 if DEVICE == "cpu" else 16
+NUM_WORKERS = 0 if DEVICE == "cpu" else 4  # number of workers for dataloaders
+CHECKPOINT_EVERY_STEP = 1000
 print(f"device: {DEVICE}")
+
+# N_EMBD must be divisible by NUM_HEADS
+assert N_EMBD % NUM_HEADS == 0, "N_EMBD must be divisible by NUM_HEADS"
 
 
 """ Read file
@@ -86,7 +93,7 @@ def encode_pad(s, block_size):
 """
 
 # There is one line per protein.
-# We shuffle for train/val split (done in place).
+# We shuffle for train/val split (in place).
 random.shuffle(lines)
 n = int(0.9 * len(lines))
 train_lines = lines[:n]
@@ -94,47 +101,48 @@ val_lines = lines[n:]
 
 
 """ Define dataset.
-    We need to define a custome PyTorch `Dataset` which disambiguates 
+    We need to define a custome PyTorch Dataset which disambiguates 
     between line indices and subsequence start indices.
 """
 
 
 class LineDataset(Dataset):
-    """A dataset where sampling is uniform over all lines.
+    """
+    A dataset where sampling is uniform over all lines.
     All lines are sampled with the same frequency.
     """
 
     def __init__(self, lines):
         self.lines = lines
-        nr_samples_per_line = [len(line) - BLOCK_SIZE for line in self.lines]
+        nr_samples_per_line = [max(1, len(line) - BLOCK_SIZE) for line in self.lines]
         self.num_samples = sum(nr_samples_per_line)
-        # self.max_line_length = max(len(line) - BLOCK_SIZE for line in lines)
 
     def __len__(self):
-        # return len(self.lines) * self.max_line_length
         return self.num_samples
 
     def __getitem__(self, idx):
         # select a line uniformly at random and then a subsequence uniformly at random
-        # use idx to setup the torch random seed
-        generator = torch.Generator()
-        generator.manual_seed(idx)
-        line_idx = torch.randint(len(self.lines), size=(1,), generator=generator).item()
+        line_idx = torch.randint(len(self.lines), size=(1,)).item()
         line = self.lines[line_idx]
         line_encoded = encode_pad(line, BLOCK_SIZE)
-        start_idx = torch.randint(
-            len(line_encoded) - BLOCK_SIZE, size=(1,), generator=generator
-        ).item()
+        start_idx = torch.randint(len(line_encoded) - BLOCK_SIZE, size=(1,)).item()
         end_idx = start_idx + BLOCK_SIZE
         x = torch.tensor(line_encoded[start_idx:end_idx], dtype=torch.long)
         y = torch.tensor(line_encoded[start_idx + 1 : end_idx + 1], dtype=torch.long)
         length = torch.tensor(min(len(line), BLOCK_SIZE), dtype=torch.long)
-        return x, y, length
+
+        if USE_TRANSFORMER:
+            # transformer uses length to mask out the padded tokens
+            return x, y, length
+        else:
+            return x, y
 
 
 class LengthAwareLineDataset(Dataset):
-    """A dataset where sampling is uniform over all possible subsequences.
+    """
+    A dataset where sampling is uniform over all possible subsequences.
     As a result, sequences are (much) more likely to come from longer lines.
+    We don't use it as it biases the lengths of generated sequences.
     """
 
     def __init__(self, lines):
@@ -167,52 +175,75 @@ class LengthAwareLineDataset(Dataset):
             line_encoded[start_idx + 1 : start_idx + BLOCK_SIZE + 1], dtype=torch.long
         )
         length = torch.tensor(min(len(line), BLOCK_SIZE), dtype=torch.long)
-        return x, y, length
+
+        if USE_TRANSFORMER:
+            # transformer uses length to mask out the padded tokens
+            return x, y, length
+        else:
+            return x, y
 
 
-inner_model = NanoTransformer(
-    vocab_size=vocab_size,
-    block_size=BLOCK_SIZE,
-    n_embd=N_EMBD,
-    n_blocks=N_BLOCKS,
-    num_heads=NUM_HEADS,
-    dropout=DROPOUT,
-)
+if USE_TRANSFORMER:
+    inner_model = NanoTransformer(
+        vocab_size=vocab_size,
+        block_size=BLOCK_SIZE,
+        n_embd=N_EMBD,
+        n_blocks=N_BLOCKS,
+        num_heads=NUM_HEADS,
+        dropout=DROPOUT,
+    )
+else:
+    inner_model = BigramModel(vocab_size=vocab_size)
 
 nano_prot_gpt = PLNanoTransformer(inner_model, LEARNING_RATE)
 
 train_dataset = LineDataset(train_lines)
-train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+train_loader = DataLoader(
+    dataset=train_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=True
+)
 
 val_dataset = LineDataset(val_lines)
-val_loader = DataLoader(dataset=val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+val_loader = DataLoader(
+    dataset=val_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False
+)
 
 # configure tensorboard logging
 logger = TensorBoardLogger("tensorboard_logs", name="nano_prot_gpt")
 
 # log hyperparameters
-logger.log_hyperparams(
-    {
-        "block_size": BLOCK_SIZE,
-        "n_embd": N_EMBD,
-        "n_blocks": N_BLOCKS,
-        "num_heads": NUM_HEADS,
-        "dropout": DROPOUT,
-        "max_iters": MAX_ITERS,
-        "learning_rate": LEARNING_RATE,
-        "batch_size": BATCH_SIZE,
-        "precision": PRECISION,
-    }
-)
+if USE_TRANSFORMER:
+    logger.log_hyperparams(
+        {
+            "block_size": BLOCK_SIZE,
+            "n_embd": N_EMBD,
+            "n_blocks": N_BLOCKS,
+            "num_heads": NUM_HEADS,
+            "dropout": DROPOUT,
+            "max_iters": MAX_ITERS,
+            "learning_rate": LEARNING_RATE,
+            "batch_size": BATCH_SIZE,
+            "precision": PRECISION,
+            "is bigram": False,
+        }
+    )
+else:
+    logger.log_hyperparams(
+        {
+            "max_iters": MAX_ITERS,
+            "learning_rate": LEARNING_RATE,
+            "batch_size": BATCH_SIZE,
+            "is_bigram": True,
+        }
+    )
+
 
 # configure model checkpointing
 checkpoint_callback = ModelCheckpoint(
-    dirpath="pl_checkpoints",
-    save_top_k=2,
+    save_top_k=5,
     monitor="val_loss",
     mode="min",
     every_n_train_steps=CHECKPOINT_EVERY_STEP,
-    filename="nano_prot_gpt-{epoch:02d}-{step:08d}-{val_loss:.4f}",
+    filename="nano_prot_gpt-{epoch:02d}-{step:07d}-{val_loss:.4f}",
 )
 
 trainer = pl.Trainer(

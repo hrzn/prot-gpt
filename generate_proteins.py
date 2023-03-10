@@ -1,18 +1,18 @@
 from collections import Counter
 import numpy as np
+import sys
 import torch
-import os
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 from nano_transformer import PLNanoTransformer
 from pytorch_lightning import seed_everything
 
-seed_everything(1337)
 
-FOLDER = "pl_checkpoints"
-FNAME = "nano_prot_gpt-epoch=00-step=00005000-val_loss=2.8516.ckpt"
+n_prots = int(sys.argv[1])  # number of proteins to generate
+checkpoint_file = sys.argv[2]  # checkpoint file to load
 PROT_FNAME = "data/prot_seqs.txt"  # needed for the vocab
+
+seed_everything(1337)
 
 
 ######## build the vocab #########
@@ -39,12 +39,7 @@ aa_to_proba_first = {aa: nr_times_first[aa] / len(lines) for aa in nr_times_firs
 
 ######## load the model (on CPU) #########
 
-full_fname = os.path.join(FOLDER, FNAME)
-device = torch.device("cpu")
-
-# load this checkpoint with PyTorch Lightning
-pl_model = PLNanoTransformer.load_from_checkpoint(full_fname, map_location=device)
-
+pl_model = PLNanoTransformer.load_from_checkpoint(checkpoint_file)
 pl_model.eval()
 
 
@@ -69,7 +64,7 @@ def generate_protein_string():
 
 
 generated_seqs = []
-for _ in tqdm(range(100)):
+for _ in tqdm(range(n_prots)):
     generated_seqs.append(generate_protein_string())
 
 with open("generated_proteins.txt", "w") as f:
