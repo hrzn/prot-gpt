@@ -1,3 +1,7 @@
+"""
+A small script to compare the lengths of the generated sequences with the lengths of the real sequences.
+"""
+
 import sys
 import matplotlib.pyplot as plt
 
@@ -9,7 +13,13 @@ with open(PROT_FNAME, "r") as f:
 with open("generated_prots/" + sys.argv[1], "r") as f:
     generated_lines = f.readlines()
 
-plt.hist([len(line) for line in lines if len(line) <= 1000], bins=50, density=True, alpha=0.5, label="real")
+plt.hist(
+    [len(line) for line in lines if len(line) <= 1000],
+    bins=50,
+    density=True,
+    alpha=0.5,
+    label="real",
+)
 plt.hist(
     [len(line) for line in generated_lines if len(line) <= 1000],
     bins=50,

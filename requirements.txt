@@ -1,4 +1,5 @@
 matplotlib
-tiktoken
+pytorch-lightning
+tensorboard
 tqdm
 torch
